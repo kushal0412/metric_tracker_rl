@@ -28,6 +28,8 @@ Usage:
     python -m server.app
 """
 
+import os
+
 try:
     from openenv.core.env_server.http_server import create_app
 except Exception as e:  # pragma: no cover
@@ -74,8 +76,16 @@ def main(host: str = "0.0.0.0", port: int = 8000):
         uvicorn metric_tracker_rl.server.app:app --workers 4
     """
     import uvicorn
+    ws_ping_interval = float(os.getenv("UVICORN_WS_PING_INTERVAL", "600"))
+    ws_ping_timeout = float(os.getenv("UVICORN_WS_PING_TIMEOUT", "600"))
 
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        ws_ping_interval=ws_ping_interval,
+        ws_ping_timeout=ws_ping_timeout,
+    )
 
 
 if __name__ == "__main__":

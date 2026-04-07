@@ -9,7 +9,9 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Any
 
+from openenv.core.containers.runtime.providers import LocalDockerProvider
 from openai import APIStatusError, OpenAI
+from websockets.exceptions import ConnectionClosedError
 
 from metric_tracker_rl import DEFAULT_TASK_ORDER, MetricTrackerRlAction, MetricTrackerRlEnv, get_task_spec
 from metric_tracker_rl.analysis_tools import available_analysis_methods
@@ -20,7 +22,7 @@ from metric_tracker_rl.models import (
 )
 
 
-IMAGE_NAME = os.getenv("IMAGE_NAME") or "metric_tracker:latest"
+IMAGE_NAME = (os.getenv("IMAGE_NAME") or "metric_tracker_rl:latest").strip()
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
 API_BASE_URL = (
     os.getenv("API_BASE_URL")
@@ -34,6 +36,10 @@ BENCHMARK = os.getenv("MetricTrackerRl_BENCHMARK", "metric_tracker_rl")
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0"))
 MAX_TOKENS = min(int(os.getenv("MAX_TOKENS", "1000")), 4096)
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "16"))
+CONNECT_TIMEOUT_S = float(os.getenv("OPENENV_CONNECT_TIMEOUT_S", "30"))
+MESSAGE_TIMEOUT_S = float(os.getenv("OPENENV_MESSAGE_TIMEOUT_S", "180"))
+DOCKER_WAIT_TIMEOUT_S = float(os.getenv("OPENENV_DOCKER_WAIT_TIMEOUT_S", "120"))
+TASK_RETRY_COUNT = int(os.getenv("OPENENV_TASK_RETRY_COUNT", "1"))
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -276,8 +282,22 @@ def preview_text(text: str, limit: int = 220) -> str:
 
 async def connect_env() -> MetricTrackerRlEnv:
     if BASE_URL:
-        return MetricTrackerRlEnv(base_url=BASE_URL)
-    return await MetricTrackerRlEnv.from_docker_image(IMAGE_NAME)
+        client = MetricTrackerRlEnv(
+            base_url=BASE_URL,
+            connect_timeout_s=CONNECT_TIMEOUT_S,
+            message_timeout_s=MESSAGE_TIMEOUT_S,
+        )
+        return await client.connect()
+    provider = LocalDockerProvider()
+    base_url = provider.start_container(IMAGE_NAME)
+    provider.wait_for_ready(base_url, timeout_s=DOCKER_WAIT_TIMEOUT_S)
+    client = MetricTrackerRlEnv(
+        base_url=base_url,
+        connect_timeout_s=CONNECT_TIMEOUT_S,
+        message_timeout_s=MESSAGE_TIMEOUT_S,
+        provider=provider,
+    )
+    return await client.connect()
 
 
 async def execute_tool_call(
@@ -541,24 +561,52 @@ async def run_single_task(
     }
 
 
+async def run_single_task_with_retries(
+    client: OpenAI,
+    task_id: str,
+) -> dict[str, Any]:
+    """Run one task with a fresh env connection and bounded reconnect retries."""
+    attempts = TASK_RETRY_COUNT + 1
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        env = None
+        try:
+            env = await connect_env()
+            return await run_single_task(client, env, task_id)
+        except (ConnectionClosedError, ConnectionError, TimeoutError, OSError) as exc:
+            last_error = exc
+            print(
+                (
+                    f"[WARN] task_id={task_id} attempt={attempt}/{attempts} "
+                    f"env_connection_error={type(exc).__name__}: {exc}"
+                ),
+                flush=True,
+            )
+            if attempt >= attempts:
+                raise
+        finally:
+            try:
+                if env is not None:
+                    await env.close()
+            except Exception:
+                pass
+
+    assert last_error is not None
+    raise last_error
+
+
 async def main() -> None:
     if not API_KEY:
         raise RuntimeError("Set OPENAI_API_KEY, HF_TOKEN, or API_KEY.")
 
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    env = await connect_env()
     task_summaries: list[dict[str, Any]] = []
 
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
-    try:
-        for task_id in DEFAULT_TASK_ORDER:
-            task_summaries.append(await run_single_task(client, env, task_id))
-    finally:
-        try:
-            await env.close()
-        except Exception:
-            pass
+    for task_id in DEFAULT_TASK_ORDER:
+        task_summaries.append(await run_single_task_with_retries(client, task_id))
 
     average_score = (
         round(sum(item["normalized_score"] for item in task_summaries) / len(task_summaries), 6)
