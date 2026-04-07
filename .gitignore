@@ -1,0 +1,25 @@
+# Secrets / local env
+.env
+.env.*
+
+# Virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Test / tool cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# OS files
+.DS_Store

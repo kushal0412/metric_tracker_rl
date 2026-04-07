@@ -1,0 +1,14 @@
+.git
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.DS_Store
+.env
+.env.*
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+tests
+openenv_metric_tracker_rl.egg-info
