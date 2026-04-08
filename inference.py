@@ -84,8 +84,9 @@ def log_payload_generator_methods(tool_name: str, generator_methods: list[dict[s
 
 def log_step(step: int, action: str, reward: float, done: bool, error: str | None) -> None:
     error_val = error if error else "null"
+    clipped_reward = bounded_log_reward(reward)
     print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error_val}",
+        f"[STEP] step={step} action={action} reward={clipped_reward:.2f} done={str(done).lower()} error={error_val}",
         flush=True,
     )
 
@@ -95,10 +96,16 @@ def bounded_task_score(score: float) -> float:
     return min(1.0 - SCORE_EPSILON, max(SCORE_EPSILON, score))
 
 
+def bounded_log_reward(reward: float) -> float:
+    """Clamp logged scores and rewards to [0.01, 0.99]."""
+    return min(0.99, max(0.01, reward))
+
+
 def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
-    rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
+    clipped_score = bounded_log_reward(score)
+    rewards_str = ",".join(f"{bounded_log_reward(reward):.2f}" for reward in rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        f"[END] success={str(success).lower()} steps={steps} score={clipped_score:.2f} rewards={rewards_str}",
         flush=True,
     )
 
