@@ -577,6 +577,8 @@ async def run_single_task(
         "expected_row_count": final_result.observation.expected_row_count,
         "tool_rounds": tool_rounds,
         "assistant_summary": final_text,
+        "steps": runtime_state.steps,
+        "rewards": runtime_state.rewards,
         "reward_breakdown": (
             final_result.observation.reward_breakdown.model_dump()
             if final_result.observation.reward_breakdown
