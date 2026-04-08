@@ -601,6 +601,7 @@ async def run_single_task_with_retries(
     """Run one task with a fresh env connection and bounded reconnect retries."""
     attempts = TASK_RETRY_COUNT + 1
     last_error: Exception | None = None
+    task_spec = get_task_spec(task_id)
 
     for attempt in range(1, attempts + 1):
         env = None
@@ -628,6 +629,37 @@ async def run_single_task_with_retries(
             )
             if attempt >= attempts:
                 raise
+        except Exception as exc:
+            last_error = exc
+            print(
+                (
+                    f"[WARN] task_id={task_id} attempt={attempt}/{attempts} "
+                    f"runtime_error={type(exc).__name__}: {exc}"
+                ),
+                flush=True,
+                file=sys.stderr,
+            )
+            if attempt >= attempts:
+                return {
+                    "task_id": task_spec.task_id,
+                    "difficulty": task_spec.difficulty,
+                    "objective": task_spec.objective,
+                    "grader_name": task_spec.grader_name,
+                    "score": bounded_task_score(0.0),
+                    "normalized_score": bounded_task_score(0.0),
+                    "done": False,
+                    "success": False,
+                    "final_status": "error",
+                    "final_message": str(exc),
+                    "issue_count": 0,
+                    "correct_row_count": 0,
+                    "expected_row_count": 0,
+                    "tool_rounds": 0,
+                    "assistant_summary": "",
+                    "steps": steps,
+                    "rewards": rewards,
+                    "reward_breakdown": None,
+                }
         finally:
             try:
                 if env is not None:
