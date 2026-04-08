@@ -66,6 +66,12 @@ class ToolRuntimeState:
 
     method_log: list[dict[str, Any]] = field(default_factory=list)
     last_preview: dict[str, Any] | None = None
+
+
+@dataclass
+class RunLogState:
+    """Global stdout logging state for the full inference run."""
+
     rewards: list[float] = field(default_factory=list)
     steps: int = 0
 
@@ -291,15 +297,15 @@ def step_error(result: Any) -> str | None:
 
 
 def record_step(
-    runtime_state: ToolRuntimeState,
+    log_state: RunLogState,
     action: str,
     result: Any,
 ) -> None:
     reward = float(result.reward or 0.0)
-    runtime_state.steps += 1
-    runtime_state.rewards.append(reward)
+    log_state.steps += 1
+    log_state.rewards.append(reward)
     log_step(
-        step=runtime_state.steps,
+        step=log_state.steps,
         action=action,
         reward=reward,
         done=bool(result.done),
@@ -331,6 +337,7 @@ async def execute_tool_call(
     env: MetricTrackerRlEnv,
     observation: MetricTrackerRlObservation,
     runtime_state: ToolRuntimeState,
+    log_state: RunLogState,
     tool_name: str,
     arguments: dict[str, Any],
 ) -> tuple[dict[str, Any], Any | None, MetricTrackerRlObservation]:
@@ -350,7 +357,7 @@ async def execute_tool_call(
             }
         )
         result = await env.step(MetricTrackerRlAction(payload_generators=methods))
-        record_step(runtime_state, action, result)
+        record_step(log_state, action, result)
         return (
             {
                 "status": result.observation.status,
@@ -371,7 +378,7 @@ async def execute_tool_call(
     if tool_name == "submit_solution":
         rows = [MetricSubmissionRow(**row) for row in arguments.get("rows", [])]
         result = await env.step(MetricTrackerRlAction(classifications=rows))
-        record_step(runtime_state, action, result)
+        record_step(log_state, action, result)
         return (
             {
                 "status": result.observation.status,
@@ -396,7 +403,7 @@ async def execute_tool_call(
             analysis_args=arguments,
         )
     )
-    record_step(runtime_state, action, result)
+    record_step(log_state, action, result)
     output = result.observation.analysis_result or {
         "method": tool_name,
         "arguments": arguments,
@@ -452,6 +459,7 @@ async def run_agent_loop(
     client: OpenAI,
     env: MetricTrackerRlEnv,
     observation: MetricTrackerRlObservation,
+    log_state: RunLogState,
 ) -> tuple[Any, str, int, list[dict[str, Any]], ToolRuntimeState]:
     """Run a tool-calling loop until the env is solved or the round limit is hit."""
     runtime_state = ToolRuntimeState()
@@ -513,6 +521,7 @@ async def run_agent_loop(
                 env,
                 current_observation,
                 runtime_state,
+                log_state,
                 tool_name,
                 arguments,
             )
@@ -545,15 +554,16 @@ async def run_single_task(
     client: OpenAI,
     env: MetricTrackerRlEnv,
     task_id: str,
+    log_state: RunLogState,
 ) -> dict[str, Any]:
     """Run one named benchmark task and return a reproducible summary."""
     task_spec = get_task_spec(task_id)
-    log_start(task=task_spec.task_id, env=BENCHMARK, model=MODEL_NAME)
     reset_result = await env.reset(task_id=task_spec.task_id)
     final_result, final_text, tool_rounds, method_log, runtime_state = await run_agent_loop(
         client,
         env,
         reset_result.observation,
+        log_state,
     )
     if final_result is None:
         raise RuntimeError(f"The model never submitted a graded action for task `{task_spec.task_id}`.")
@@ -577,8 +587,6 @@ async def run_single_task(
         "expected_row_count": final_result.observation.expected_row_count,
         "tool_rounds": tool_rounds,
         "assistant_summary": final_text,
-        "steps": runtime_state.steps,
-        "rewards": runtime_state.rewards,
         "reward_breakdown": (
             final_result.observation.reward_breakdown.model_dump()
             if final_result.observation.reward_breakdown
@@ -590,6 +598,7 @@ async def run_single_task(
 async def run_single_task_with_retries(
     client: OpenAI,
     task_id: str,
+    log_state: RunLogState,
 ) -> dict[str, Any]:
     """Run one task with a fresh env connection and bounded reconnect retries."""
     attempts = TASK_RETRY_COUNT + 1
@@ -597,18 +606,9 @@ async def run_single_task_with_retries(
 
     for attempt in range(1, attempts + 1):
         env = None
-        success = False
-        steps = 0
-        score = 0.0
-        rewards: list[float] = []
         try:
             env = await connect_env()
-            summary = await run_single_task(client, env, task_id)
-            success = bool(summary["success"])
-            steps = int(summary["steps"])
-            score = float(summary["score"])
-            rewards = list(summary["rewards"])
-            return summary
+            return await run_single_task(client, env, task_id, log_state)
         except (ConnectionClosedError, ConnectionError, TimeoutError, OSError) as exc:
             last_error = exc
             print(
@@ -627,8 +627,6 @@ async def run_single_task_with_retries(
                     await env.close()
             except Exception:
                 pass
-            if env is not None:
-                log_end(success=success, steps=steps, score=score, rewards=rewards)
 
     assert last_error is not None
     raise last_error
@@ -640,9 +638,22 @@ async def main() -> None:
 
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     task_summaries: list[dict[str, Any]] = []
+    log_state = RunLogState()
+    success = False
+    score = 0.0
 
-    for task_id in DEFAULT_TASK_ORDER:
-        task_summaries.append(await run_single_task_with_retries(client, task_id))
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    try:
+        for task_id in DEFAULT_TASK_ORDER:
+            task_summaries.append(await run_single_task_with_retries(client, task_id, log_state))
+        success = all(item["success"] for item in task_summaries) if task_summaries else False
+        score = (
+            round(sum(float(item["score"]) for item in task_summaries) / len(task_summaries), 6)
+            if task_summaries
+            else 0.0
+        )
+    finally:
+        log_end(success=success, steps=log_state.steps, score=score, rewards=log_state.rewards)
 
 
 if __name__ == "__main__":
