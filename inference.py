@@ -40,6 +40,7 @@ CONNECT_TIMEOUT_S = float(os.getenv("OPENENV_CONNECT_TIMEOUT_S", "30"))
 MESSAGE_TIMEOUT_S = float(os.getenv("OPENENV_MESSAGE_TIMEOUT_S", "180"))
 DOCKER_WAIT_TIMEOUT_S = float(os.getenv("OPENENV_DOCKER_WAIT_TIMEOUT_S", "120"))
 TASK_RETRY_COUNT = int(os.getenv("OPENENV_TASK_RETRY_COUNT", "1"))
+SCORE_EPSILON = float(os.getenv("OPENENV_SCORE_EPSILON", "0.000001"))
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -92,9 +93,15 @@ def log_step(step: int, action: str, reward: float, done: bool, error: str | Non
     )
 
 
+def bounded_task_score(score: float) -> float:
+    """Clamp task scores to the open interval (0, 1)."""
+    return min(1.0 - SCORE_EPSILON, max(SCORE_EPSILON, score))
+
+
 def log_end(success: bool, steps: int, score: float, method_log: list[dict[str, Any]]) -> None:
+    safe_score = bounded_task_score(score)
     print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} methods={len(method_log)}",
+        f"[END] success={str(success).lower()} steps={steps} score={safe_score:.6f} methods={len(method_log)}",
         flush=True,
     )
     print(json.dumps({"method_log": method_log}, indent=2), flush=True)
@@ -543,7 +550,7 @@ async def run_single_task(
         "difficulty": task_spec.difficulty,
         "objective": task_spec.objective,
         "grader_name": task_spec.grader_name,
-        "normalized_score": max(0.0, min(1.0, reward)),
+        "normalized_score": bounded_task_score(reward),
         "done": final_result.done,
         "success": success,
         "final_status": final_result.observation.status,
