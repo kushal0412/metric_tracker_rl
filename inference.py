@@ -95,9 +95,12 @@ def bounded_task_score(score: float) -> float:
     return min(1.0 - SCORE_EPSILON, max(SCORE_EPSILON, score))
 
 
-def log_end(success: bool, steps: int, rewards: list[float]) -> None:
+def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
     rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}", flush=True)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 def tool_schemas() -> list[dict[str, Any]]:
@@ -596,12 +599,14 @@ async def run_single_task_with_retries(
         env = None
         success = False
         steps = 0
+        score = 0.0
         rewards: list[float] = []
         try:
             env = await connect_env()
             summary = await run_single_task(client, env, task_id)
             success = bool(summary["success"])
             steps = int(summary["steps"])
+            score = float(summary["score"])
             rewards = list(summary["rewards"])
             return summary
         except (ConnectionClosedError, ConnectionError, TimeoutError, OSError) as exc:
@@ -623,7 +628,7 @@ async def run_single_task_with_retries(
             except Exception:
                 pass
             if env is not None:
-                log_end(success=success, steps=steps, rewards=rewards)
+                log_end(success=success, steps=steps, score=score, rewards=rewards)
 
     assert last_error is not None
     raise last_error
