@@ -92,7 +92,8 @@ def test_evaluator_scores_perfect_submission():
     result = evaluate_submission(expected_rows, expected_rows)
 
     assert result.is_perfect is True
-    assert result.reward_breakdown.total_score == 1.0
+    assert 0.0 < result.reward_breakdown.total_score < 1.0
+    assert result.reward_breakdown.total_score == 0.999999
     assert result.reward_breakdown.extra_rows == 0
     assert result.reward_breakdown.duplicate_rows == 0
     assert result.reward_breakdown.invalid_rows == 0
@@ -117,7 +118,8 @@ def test_task_grader_scores_perfect_submission():
     result = task.grade_submission(episode.expected_rows, episode.expected_rows)
 
     assert result.is_perfect is True
-    assert result.reward_breakdown.total_score == 1.0
+    assert 0.0 < result.reward_breakdown.total_score < 1.0
+    assert result.reward_breakdown.total_score == 0.999999
 
 
 def test_duplicate_and_extra_rows_are_penalized():

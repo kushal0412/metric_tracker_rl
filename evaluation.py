@@ -11,6 +11,8 @@ except ImportError:
     from analysis_tools import preview_submission_rows, submission_row_key
     from models import MetricSubmissionRow, RewardBreakdown, SubmissionIssue, SubmissionPreview
 
+SCORE_EPSILON = 0.000001
+
 
 @dataclass(frozen=True)
 class EvaluationConfig:
@@ -40,6 +42,12 @@ class EvaluationResult:
     reward_breakdown: RewardBreakdown
     matched_rows: int
     is_perfect: bool
+
+
+def _bounded_total_score(score: float) -> float:
+    """Clamp evaluator scores to the open interval (0, 1)."""
+    rounded_score = round(score, 6)
+    return min(1.0 - SCORE_EPSILON, max(SCORE_EPSILON, rounded_score))
 
 
 def evaluate_submission(
@@ -133,7 +141,7 @@ def evaluate_submission(
         - invalid_penalty
         - exploit_penalty
     )
-    total_score = max(0.0, min(1.0, round(total_score, 6)))
+    total_score = _bounded_total_score(total_score)
 
     breakdown = RewardBreakdown(
         precision=round(precision, 6),
