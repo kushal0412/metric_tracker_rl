@@ -52,9 +52,9 @@ SYSTEM_PROMPT = textwrap.dedent(
     - Do not request full hidden answers or assume direct access to ground truth.
     - Prefer declarative payload generators over manual row construction.
     - Start from the default reset observation only.
-    - Start by trying `get_median_filter_rows` across different metrics to learn which metrics produce useful anomaly rows.
+    - Start by trying `get_rate_spike_from_median_rows` across different conversion metrics to learn which metrics produce useful anomaly rows.
     - Compare candidate metrics, then refine with raw-data inspection and median/std methods only when needed.
-    - Prefer: task_overview -> get_median_filter_rows on several metrics -> compare useful results -> payload_generator -> submit_payload_generator.
+    - Prefer: task_overview -> get_rate_spike_from_median_rows on several conversion metrics -> compare useful results -> payload_generator -> submit_payload_generator.
     - Keep notes brief and factual.
     """
 ).strip()
@@ -245,7 +245,7 @@ def build_initial_user_prompt(observation: MetricTrackerRlObservation) -> str:
         {json.dumps(observation.model_dump(exclude={"debug"}), indent=2)}
 
         Prefer building a payload generator first, then submit it.
-        Start by calling `get_median_filter_rows` on several different metrics and see which ones return useful anomaly rows.
+        Start by calling `get_rate_spike_from_median_rows` on several conversion metrics and see which ones return useful anomaly rows.
         If a metric returns nothing or low-signal rows, try another metric.
         For funnel, hourly mix, or data-quality tasks, use the family-specific generator methods instead.
 
@@ -254,9 +254,9 @@ def build_initial_user_prompt(observation: MetricTrackerRlObservation) -> str:
         `baseline_value`, `observed_value`, `delta_value`, `severity`.
 
         Supported generator method example:
-        `{{"method_name":"get_median_filter_rows","threshold_multiplier":2.0}}`
+        `{{"method_name":"get_rate_spike_from_median_rows","threshold_multiplier":2.0}}`
         or
-        `{{"method_name":"get_median_filter_rows","metric_names":["app_open_to_order_placed","orders_placed"],"threshold_multiplier":2.0}}`
+        `{{"method_name":"get_rate_spike_from_median_rows","metric_names":["app_open_to_order_placed","app_open_to_payment_successful"],"threshold_multiplier":2.0}}`
 
         Use shared analysis methods only. Prefer `submit_payload_generator` over `submit_solution`.
         """

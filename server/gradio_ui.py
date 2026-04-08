@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+from statistics import median
 
 import pandas as pd
 
@@ -48,6 +50,26 @@ METRIC_CHOICES = [
     "app_open_to_order_placed",
     "app_open_to_payment_successful",
 ]
+CONVERSION_METRICS = [
+    "app_open_to_menu_open",
+    "menu_open_to_product_added_to_cart",
+    "product_added_to_cart_to_order_placed",
+    "order_placed_to_payment_successful",
+    "app_open_to_order_placed",
+    "app_open_to_payment_successful",
+]
+THRESHOLD_METHODS = {
+    "get_rows_with_abs_diff_from_median_gt",
+    "get_median_filter_rows",
+    "get_rate_drop_from_median_rows",
+    "get_rate_spike_from_median_rows",
+    "get_absolute_drop_in_event_count_rows",
+    "get_absolute_spike_in_event_count_rows",
+}
+MEDIAN_METHODS = THRESHOLD_METHODS | {
+    "get_metric_median",
+    "get_metric_std_dev_from_median",
+}
 
 
 def build_metric_tracker_gradio_app(
@@ -75,7 +97,7 @@ def build_metric_tracker_gradio_app(
             Standard mode exposes method calls only. You inspect data through methods like
             `show_raw_data`, `get_metric_median`, `get_metric_std_dev_from_median`,
             and `get_rows_with_abs_diff_from_median_gt`, then assemble payload generators
-            such as `get_median_filter_rows(metric_name, threshold_multiplier)`.
+            such as `get_rate_spike_from_median_rows(metric_name, threshold_multiplier)`.
             """
         )
 
@@ -137,19 +159,19 @@ def build_metric_tracker_gradio_app(
 
         gr.Markdown("## Methods")
         gr.Markdown(
-            "Run a method after reset to fetch exactly the daily aggregate data, median, "
-            "std-from-median, filtered rows, or generated payload rows you want."
+            "Run a method after reset to inspect daily aggregate data and then start from "
+            "rate-spike detection on conversion metrics before broadening the search."
         )
         with gr.Row():
             method_name = gr.Dropdown(
                 label="Method",
                 choices=METHOD_CHOICES,
-                value="show_raw_data",
+                value="get_rate_spike_from_median_rows",
             )
             method_metric = gr.Dropdown(
                 label="metrics",
                 choices=METRIC_CHOICES,
-                value=[],
+                value=CONVERSION_METRICS,
                 multiselect=True,
             )
             method_threshold = gr.Number(label="threshold / multiplier", value=2.0)
@@ -164,12 +186,26 @@ def build_metric_tracker_gradio_app(
             value="[]",
             interactive=True,
         )
+        plot_metrics = gr.Dropdown(
+            label="Plot Metrics",
+            choices=METRIC_CHOICES,
+            value=CONVERSION_METRICS,
+            multiselect=True,
+        )
+        metric_plot = gr.LinePlot(
+            label="Metric Plot",
+            x="date",
+            y="value",
+            color="series",
+            tooltip=["date", "series", "value"],
+        )
+        generated_rows = gr.Dataframe(label="Payload Rows For Current Method", interactive=False)
         analysis_result = gr.JSON(label="Last Method Results")
 
         with gr.Tab("Method Data"):
             gr.Markdown(
-                "This panel shows only method-returned data. Use `show_raw_data` for daily "
-                "aggregate rows, then median/std/filter methods to inspect candidate anomalies."
+                "This panel shows only method-returned data. The chart already loads all daily "
+                "rows on reset, so use this table to inspect the exact rows returned by the current method."
             )
             method_rows = gr.Dataframe(label="Method Rows", interactive=False)
 
@@ -185,11 +221,11 @@ def build_metric_tracker_gradio_app(
         )
         payload_generator_methods = gr.JSON(label="Methods Passed to Payload Generator")
         with gr.Row():
-            generator_method_name = gr.Dropdown(label="method_name", choices=GENERATOR_METHODS, value="get_median_filter_rows")
+            generator_method_name = gr.Dropdown(label="method_name", choices=GENERATOR_METHODS, value="get_rate_spike_from_median_rows")
             generator_metric_name = gr.Dropdown(
                 label="metrics",
                 choices=METRIC_CHOICES,
-                value=[],
+                value=CONVERSION_METRICS,
                 multiselect=True,
             )
             generator_multiplier = gr.Number(label="threshold_multiplier", value=2.0)
@@ -207,7 +243,6 @@ def build_metric_tracker_gradio_app(
         available_methods = gr.JSON(label="Shared Methods")
         submission_feedback = gr.JSON(label="Submission Feedback")
         reward_breakdown = gr.JSON(label="Reward Breakdown")
-        generated_rows = gr.Dataframe(label="Generated Payload Rows", interactive=False)
         raw_json = gr.Code(label="Latest Environment Response", language="json", interactive=False)
         debug_snapshot = gr.JSON(label="Debug Snapshot")
 
@@ -222,7 +257,17 @@ def build_metric_tracker_gradio_app(
                 task.to_model().model_dump(),
             )
 
-        async def reset_episode(selected_task_id, seed_value, family, level, density, anomaly_count_value, reset_anomalies_json, debug_enabled):
+        async def reset_episode(
+            selected_task_id,
+            seed_value,
+            family,
+            level,
+            density,
+            anomaly_count_value,
+            reset_anomalies_json,
+            debug_enabled,
+            selected_plot_metrics,
+        ):
             try:
                 parsed_anomalies = json.loads(reset_anomalies_json or "[]")
                 if not isinstance(parsed_anomalies, list):
@@ -240,6 +285,7 @@ def build_metric_tracker_gradio_app(
                     {},
                     {},
                     {},
+                    _plot_frame([], selected_plot_metrics, None),
                     _generator_frame([]),
                     _generator_frame([]),
                     "",
@@ -262,7 +308,7 @@ def build_metric_tracker_gradio_app(
             method_data = await web_manager.step_environment(
                 {
                     "analysis_method": "show_raw_data",
-                    "analysis_args": {"limit": 5},
+                    "analysis_args": {"limit": 10000},
                     "classifications": [],
                     "payload_generators": [],
                 }
@@ -270,8 +316,11 @@ def build_metric_tracker_gradio_app(
             state = _state_from_response(data)
             state["latest_response"] = method_data
             state["last_method_result"] = method_data.get("observation", {}).get("analysis_result")
+            state["raw_rows"] = ((state["last_method_result"] or {}).get("result") or {}).get("rows", [])
+            state["last_plot_context"] = None
             obs = data.get("observation", {})
             method_result = state["last_method_result"] or {}
+            plot_frame = _plot_frame(state["raw_rows"], selected_plot_metrics, state["last_plot_context"])
             available_tasks = obs.get("available_tasks") or list(TASK_SUMMARIES.values())
             active_task_payload = next(
                 (item for item in available_tasks if item.get("task_id") == obs.get("task_id")),
@@ -300,6 +349,7 @@ def build_metric_tracker_gradio_app(
                 method_result,
                 obs.get("submission_issues") or [],
                 obs.get("reward_breakdown") or {},
+                plot_frame,
                 _method_frame(method_result),
                 pd.DataFrame(),
                 json.dumps(method_data, indent=2),
@@ -317,9 +367,10 @@ def build_metric_tracker_gradio_app(
             method_rows_value: str,
             threshold: float,
             limit_value: int,
+            selected_plot_metrics: list[str],
         ):
             if not payload.get("active"):
-                return payload, {"error": "Reset the environment first."}, "", gr.skip(), gr.skip(), gr.skip()
+                return payload, {"error": "Reset the environment first."}, "", gr.skip(), gr.skip(), gr.skip(), gr.skip()
             args = _method_args(
                 selected_method,
                 metric_names,
@@ -340,13 +391,20 @@ def build_metric_tracker_gradio_app(
             )
             payload["latest_response"] = data
             payload["last_method_result"] = data.get("observation", {}).get("analysis_result")
+            payload["last_plot_context"] = {
+                "method_name": selected_method,
+                "metric_names": [item for item in (metric_names or []) if item],
+                "threshold": float(threshold),
+            }
             method_result = payload["last_method_result"] or {}
             generated = method_result.get("result", {}).get("generated_rows", [])
             method_frame = _method_frame(method_result)
+            plot_frame = _plot_frame(payload.get("raw_rows", []), selected_plot_metrics, payload["last_plot_context"])
             return (
                 payload,
                 method_result,
                 data.get("observation", {}).get("message", ""),
+                plot_frame,
                 method_frame,
                 pd.DataFrame(generated),
                 json.dumps(data, indent=2),
@@ -474,9 +532,16 @@ def build_metric_tracker_gradio_app(
         def get_state_sync():
             return json.dumps(web_manager.get_state(), indent=2)
 
+        def update_plot(payload: dict, selected_plot_metrics: list[str]):
+            return _plot_frame(
+                payload.get("raw_rows", []),
+                selected_plot_metrics,
+                payload.get("last_plot_context"),
+            )
+
         reset_btn.click(
             fn=reset_episode,
-            inputs=[task_id, seed, scenario_family, difficulty, anomaly_density, anomaly_count, reset_anomalies, debug_mode],
+            inputs=[task_id, seed, scenario_family, difficulty, anomaly_density, anomaly_count, reset_anomalies, debug_mode, plot_metrics],
             outputs=[
                 session_state,
                 status,
@@ -489,6 +554,7 @@ def build_metric_tracker_gradio_app(
                 analysis_result,
                 submission_feedback,
                 reward_breakdown,
+                metric_plot,
                 method_rows,
                 generated_rows,
                 raw_json,
@@ -513,8 +579,14 @@ def build_metric_tracker_gradio_app(
                 method_rows_json,
                 method_threshold,
                 method_limit,
+                plot_metrics,
             ],
-            outputs=[session_state, analysis_result, status, method_rows, generated_rows, raw_json],
+            outputs=[session_state, analysis_result, status, metric_plot, method_rows, generated_rows, raw_json],
+        )
+        plot_metrics.change(
+            fn=update_plot,
+            inputs=[session_state, plot_metrics],
+            outputs=[metric_plot],
         )
         add_generator_btn.click(
             fn=add_or_update_generator,
@@ -649,6 +721,8 @@ def _state_from_response(data: dict) -> dict:
         "payload_generators": [],
         "last_method_result": data.get("observation", {}).get("analysis_result"),
         "latest_response": data,
+        "raw_rows": [],
+        "last_plot_context": None,
     }
 
 
@@ -725,4 +799,86 @@ def _empty_state() -> dict:
         "payload_generators": [],
         "last_method_result": None,
         "latest_response": None,
+        "raw_rows": [],
+        "last_plot_context": None,
     }
+
+
+def _plot_frame(raw_rows: list[dict], selected_metrics: list[str], plot_context: dict | None) -> pd.DataFrame:
+    if not raw_rows:
+        return pd.DataFrame(columns=["date", "value", "series"])
+    frame = pd.DataFrame(raw_rows)
+    if "date" not in frame.columns:
+        return pd.DataFrame(columns=["date", "value", "series"])
+    metrics = [item for item in (selected_metrics or []) if item in frame.columns]
+    if not metrics:
+        return pd.DataFrame(columns=["date", "value", "series"])
+
+    rows: list[dict] = []
+    for metric_name in metrics:
+        values = pd.to_numeric(frame[metric_name], errors="coerce")
+        for date_value, numeric_value in zip(frame["date"], values):
+            if pd.isna(numeric_value):
+                continue
+            rows.append(
+                {
+                    "date": date_value,
+                    "value": float(numeric_value),
+                    "series": metric_name,
+                }
+            )
+        rows.extend(_overlay_rows(frame, metric_name, plot_context))
+    return pd.DataFrame(rows, columns=["date", "value", "series"])
+
+
+def _overlay_rows(frame: pd.DataFrame, metric_name: str, plot_context: dict | None) -> list[dict]:
+    if not plot_context:
+        return []
+    selected_metrics = [item for item in (plot_context.get("metric_names") or []) if item]
+    method_name = plot_context.get("method_name")
+    threshold = float(plot_context.get("threshold", 0.0))
+    if metric_name not in selected_metrics or method_name not in MEDIAN_METHODS:
+        return []
+
+    values = [float(item) for item in pd.to_numeric(frame[metric_name], errors="coerce").dropna().tolist()]
+    if not values:
+        return []
+    dates = frame["date"].tolist()
+    metric_median = float(median(values))
+    rows = [
+        {"date": date_value, "value": metric_median, "series": f"{metric_name} median"}
+        for date_value in dates
+    ]
+    threshold_value = None
+    if method_name == "get_metric_std_dev_from_median":
+        threshold_value = _std_from_median(values)
+    elif method_name == "get_rows_with_abs_diff_from_median_gt":
+        threshold_value = threshold
+    elif method_name in THRESHOLD_METHODS:
+        threshold_value = _std_from_median(values) * threshold
+
+    if threshold_value is None:
+        return rows
+    upper = metric_median + threshold_value
+    lower = metric_median - threshold_value
+    suffix = (
+        f"{threshold:.2f}*std"
+        if method_name in THRESHOLD_METHODS and method_name != "get_rows_with_abs_diff_from_median_gt"
+        else "threshold"
+    )
+    rows.extend(
+        {"date": date_value, "value": upper, "series": f"{metric_name} + {suffix}"}
+        for date_value in dates
+    )
+    rows.extend(
+        {"date": date_value, "value": lower, "series": f"{metric_name} - {suffix}"}
+        for date_value in dates
+    )
+    return rows
+
+
+def _std_from_median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    metric_median = median(values)
+    return math.sqrt(sum((value - metric_median) ** 2 for value in values) / len(values))

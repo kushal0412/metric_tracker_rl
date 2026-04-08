@@ -84,19 +84,118 @@ Humans in the Gradio debugger and agents in `inference.py` use the same read-onl
 
 This keeps the benchmark focused on investigation quality rather than privileged access.
 
+## How The Agent Should Choose Methods
+
+The intended agent behavior is not "call every tool and submit everything." The benchmark rewards selecting the narrowest useful method for the anomaly family that the evidence supports.
+
+Practical method-selection rules:
+
+- start with `task_overview` to confirm the task shape, expected payload format, and visible config
+- use broad discovery methods first when the anomaly family is unclear:
+  - `get_median_filter_rows`
+  - `list_suspicious_dates`
+  - `rows_for_date`
+- use targeted confirmation methods once a candidate anomaly is visible:
+  - `compare_count_to_median` for event-count spikes or drops
+  - `compare_rate_to_median` for conversion-rate shifts
+  - `detect_funnel_break` for step-level funnel problems
+  - `check_impossible_counts` for instrumentation or impossible-value issues
+- use family-specific generator methods when the anomaly family is already clear:
+  - `get_absolute_spike_in_event_count_rows`
+  - `get_absolute_drop_in_event_count_rows`
+  - `get_rate_spike_from_median_rows`
+  - `get_rate_drop_from_median_rows`
+  - `get_funnel_break_rows`
+  - `get_hourly_traffic_mix_shift_rows`
+  - `get_instrumentation_data_quality_issue_rows`
+- prefer fewer high-confidence rows over broad over-submission because extra rows are penalized
+- use `preview_submission` before final submission when manually building rows
+
+In practice, a strong agent usually follows this pattern:
+
+1. Identify which metric family is likely broken.
+2. Confirm the exact date and entity with a comparison tool.
+3. Generate the smallest plausible payload.
+4. Submit only when the evidence is specific enough to justify the row.
+
+## How Payload Generation Works In The Server
+
+The server supports two final submission paths:
+
+- direct row submission with `classifications`
+- declarative server-side generation with `payload_generators`
+
+The payload-generator path is usually simpler and more stable because the model chooses methods and thresholds, and the server constructs the final anomaly rows.
+
+Simple flow:
+
+```text
+LLM
+  -> choose analysis method from available_methods
+  -> inspect evidence from analysis_result
+  -> choose one or more payload generator methods
+  -> submit payload_generators
+
+Server
+  -> run payload_generator inside the environment
+  -> create normalized submission rows
+  -> grade submitted_rows against hidden expected_rows
+  -> return reward_breakdown, submission_issues, generated_rows
+```
+
+At the server level, the path is:
+
+```text
+MetricTrackerRlAction(payload_generators=[...])
+  -> environment step
+  -> _run_analysis("payload_generator", ...)
+  -> generated_rows
+  -> grade_submission(submitted_rows, expected_rows)
+  -> observation.reward_breakdown + observation.submission_issues
+```
+
+This means the LLM is responsible for choosing the right generator method, but the server is responsible for turning that declarative request into actual payload rows and grading them.
+
+## Example Decision Path
+
+Suppose the agent suspects a conversion-rate drop but does not yet know which metric is responsible.
+
+```text
+1. task_overview()
+2. get_median_filter_rows(metric_names=["app_open_to_order_placed", "app_open_to_payment_successful"], threshold_multiplier=2.0)
+3. compare_rate_to_median(date="2026-03-19", entity_name="app_open_to_payment_successful")
+4. payload_generator(generator_methods=[
+     {
+       "method_name": "get_rate_drop_from_median_rows",
+       "metric_name": "app_open_to_payment_successful",
+       "threshold_multiplier": 2.0
+     }
+   ])
+5. submit_payload_generator(...)
+```
+
+What happens conceptually:
+
+- the first broad method narrows the search space
+- the comparison method confirms the metric/date pair with a baseline and observed value
+- the generator submission asks the server to build the final row in the benchmark's required schema
+- the grader scores the generated payload against the hidden expected anomalies
+
+If the feedback reports extra rows or missing rows, the agent should refine the generator choice or threshold rather than blindly adding more methods.
+
 ## Tasks And Expected Difficulty
 
 The benchmark ships with three named deterministic tasks:
 
 1. `easy_single_spike`
    Expected difficulty: easy.
-   One obvious event-count spike is present. A careful single-method investigation should usually be enough.
+   Two rate-spike anomalies are present. A careful targeted investigation should usually be enough.
 2. `medium_mixed_pair`
    Expected difficulty: medium.
    Three anomalies are present across mixed count and rate signals. Precision matters because over-submission is penalized.
 3. `hard_mixed_multi`
    Expected difficulty: hard.
-   Five anomalies are present with higher density and weaker signal separation. Agents need broader exploration and tighter filtering.
+   Four anomalies are present with higher density and weaker signal separation. Agents need broader exploration and tighter filtering.
 
 Supported anomaly families across resets:
 

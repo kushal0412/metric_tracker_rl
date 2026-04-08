@@ -77,16 +77,16 @@ TASKS: dict[str, TaskSpec] = {
         task_id="easy_single_spike",
         difficulty="easy",
         instruction=(
-            "Investigate the seeded funnel dataset and submit the single anomalous row. "
+            "Investigate the seeded funnel dataset and submit every anomalous row. "
             "Use the shared analysis methods before submitting."
         ),
         objective=(
-            "Find the one obvious anomaly and submit exactly one correctly populated anomaly row."
+            "Find all anomalies and submit every correctly populated anomaly row."
         ),
         seed=11,
-        scenario_family="absolute_spike_in_event_count",
+        scenario_family="rate_spike_from_median",
         anomaly_density="low",
-        anomaly_count=1,
+        anomaly_count=2,
     ),
     "medium_mixed_pair": TaskSpec(
         task_id="medium_mixed_pair",
@@ -116,7 +116,7 @@ TASKS: dict[str, TaskSpec] = {
         seed=37,
         scenario_family="mixed",
         anomaly_density="high",
-        anomaly_count=5,
+        anomaly_count=4,
     ),
 }
 
