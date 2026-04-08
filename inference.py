@@ -535,6 +535,7 @@ async def run_single_task(
         raise RuntimeError(f"The model never submitted a graded action for task `{task_spec.task_id}`.")
 
     reward = float(final_result.reward or 0.0)
+    task_score = bounded_task_score(reward)
     success = bool(final_result.done and reward >= 0.999999)
     log_step(
         step=1,
@@ -543,14 +544,15 @@ async def run_single_task(
         done=bool(final_result.done),
         error=None,
     )
-    log_end(success=success, steps=1, score=reward, method_log=method_log)
+    log_end(success=success, steps=1, score=task_score, method_log=method_log)
     log_task_boundary(task_spec.task_id, task_spec.difficulty, "END")
     return {
         "task_id": task_spec.task_id,
         "difficulty": task_spec.difficulty,
         "objective": task_spec.objective,
         "grader_name": task_spec.grader_name,
-        "normalized_score": bounded_task_score(reward),
+        "score": task_score,
+        "normalized_score": task_score,
         "done": final_result.done,
         "success": success,
         "final_status": final_result.observation.status,
@@ -616,7 +618,7 @@ async def main() -> None:
         task_summaries.append(await run_single_task_with_retries(client, task_id))
 
     average_score = (
-        round(sum(item["normalized_score"] for item in task_summaries) / len(task_summaries), 6)
+        round(sum(item["score"] for item in task_summaries) / len(task_summaries), 6)
         if task_summaries
         else 0.0
     )
