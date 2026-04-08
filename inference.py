@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,6 +66,8 @@ class ToolRuntimeState:
 
     method_log: list[dict[str, Any]] = field(default_factory=list)
     last_preview: dict[str, Any] | None = None
+    rewards: list[float] = field(default_factory=list)
+    steps: int = 0
 
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -72,23 +75,17 @@ def log_start(task: str, env: str, model: str) -> None:
 
 
 def log_method(tool_name: str, arguments: dict[str, Any], note: str) -> None:
-    print(
-        f"[METHOD] name={tool_name} args={json.dumps(arguments, sort_keys=True)} why={note}",
-        flush=True,
-    )
+    return None
 
 
 def log_payload_generator_methods(tool_name: str, generator_methods: list[dict[str, Any]]) -> None:
-    print(
-        f"[PAYLOAD_GENERATOR_METHODS] source={tool_name} methods={json.dumps(generator_methods, sort_keys=True)}",
-        flush=True,
-    )
+    return None
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: str | None) -> None:
     error_val = error if error else "null"
     print(
-        f"[STEP] step={step} action={action} reward={reward:.3f} done={str(done).lower()} error={error_val}",
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error_val}",
         flush=True,
     )
 
@@ -98,17 +95,9 @@ def bounded_task_score(score: float) -> float:
     return min(1.0 - SCORE_EPSILON, max(SCORE_EPSILON, score))
 
 
-def log_end(success: bool, steps: int, score: float, method_log: list[dict[str, Any]]) -> None:
-    safe_score = bounded_task_score(score)
-    print(
-        f"[END] success={str(success).lower()} steps={steps} score={safe_score:.6f} methods={len(method_log)}",
-        flush=True,
-    )
-    print(json.dumps({"method_log": method_log}, indent=2), flush=True)
-
-
-def log_task_boundary(task_id: str, difficulty: str, phase: str) -> None:
-    print(f"[TASK_{phase}] task_id={task_id} difficulty={difficulty}", flush=True)
+def log_end(success: bool, steps: int, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}", flush=True)
 
 
 def tool_schemas() -> list[dict[str, Any]]:
@@ -287,6 +276,34 @@ def preview_text(text: str, limit: int = 220) -> str:
     return text.replace("\n", " ")[:limit]
 
 
+def format_action(tool_name: str, arguments: dict[str, Any]) -> str:
+    if not arguments:
+        return f"{tool_name}()"
+    return preview_text(f"{tool_name}({json.dumps(arguments, sort_keys=True)})")
+
+
+def step_error(result: Any) -> str | None:
+    message = getattr(result.observation, "message", None)
+    return message if result.observation.status == "error" and message else None
+
+
+def record_step(
+    runtime_state: ToolRuntimeState,
+    action: str,
+    result: Any,
+) -> None:
+    reward = float(result.reward or 0.0)
+    runtime_state.steps += 1
+    runtime_state.rewards.append(reward)
+    log_step(
+        step=runtime_state.steps,
+        action=action,
+        reward=reward,
+        done=bool(result.done),
+        error=step_error(result),
+    )
+
+
 async def connect_env() -> MetricTrackerRlEnv:
     if BASE_URL:
         client = MetricTrackerRlEnv(
@@ -315,6 +332,7 @@ async def execute_tool_call(
     arguments: dict[str, Any],
 ) -> tuple[dict[str, Any], Any | None, MetricTrackerRlObservation]:
     """Execute one model-requested tool locally."""
+    action = format_action(tool_name, arguments)
     if tool_name == "submit_payload_generator":
         methods = [
             PayloadGeneratorMethod(**item)
@@ -329,6 +347,7 @@ async def execute_tool_call(
             }
         )
         result = await env.step(MetricTrackerRlAction(payload_generators=methods))
+        record_step(runtime_state, action, result)
         return (
             {
                 "status": result.observation.status,
@@ -349,6 +368,7 @@ async def execute_tool_call(
     if tool_name == "submit_solution":
         rows = [MetricSubmissionRow(**row) for row in arguments.get("rows", [])]
         result = await env.step(MetricTrackerRlAction(classifications=rows))
+        record_step(runtime_state, action, result)
         return (
             {
                 "status": result.observation.status,
@@ -373,6 +393,7 @@ async def execute_tool_call(
             analysis_args=arguments,
         )
     )
+    record_step(runtime_state, action, result)
     output = result.observation.analysis_result or {
         "method": tool_name,
         "arguments": arguments,
@@ -428,7 +449,7 @@ async def run_agent_loop(
     client: OpenAI,
     env: MetricTrackerRlEnv,
     observation: MetricTrackerRlObservation,
-) -> tuple[Any, str, int, list[dict[str, Any]]]:
+) -> tuple[Any, str, int, list[dict[str, Any]], ToolRuntimeState]:
     """Run a tool-calling loop until the env is solved or the round limit is hit."""
     runtime_state = ToolRuntimeState()
     current_observation = observation
@@ -514,7 +535,7 @@ async def run_agent_loop(
             final_text = (completion.choices[0].message.content or "").strip()
             break
 
-    return last_result, final_text, tool_rounds, runtime_state.method_log
+    return last_result, final_text, tool_rounds, runtime_state.method_log, runtime_state
 
 
 async def run_single_task(
@@ -524,9 +545,9 @@ async def run_single_task(
 ) -> dict[str, Any]:
     """Run one named benchmark task and return a reproducible summary."""
     task_spec = get_task_spec(task_id)
-    log_task_boundary(task_spec.task_id, task_spec.difficulty, "START")
+    log_start(task=task_spec.task_id, env=BENCHMARK, model=MODEL_NAME)
     reset_result = await env.reset(task_id=task_spec.task_id)
-    final_result, final_text, tool_rounds, method_log = await run_agent_loop(
+    final_result, final_text, tool_rounds, method_log, runtime_state = await run_agent_loop(
         client,
         env,
         reset_result.observation,
@@ -537,15 +558,6 @@ async def run_single_task(
     reward = float(final_result.reward or 0.0)
     task_score = bounded_task_score(reward)
     success = bool(final_result.done and reward >= 0.999999)
-    log_step(
-        step=1,
-        action=preview_text(final_text or "graded_submission"),
-        reward=reward,
-        done=bool(final_result.done),
-        error=None,
-    )
-    log_end(success=success, steps=1, score=task_score, method_log=method_log)
-    log_task_boundary(task_spec.task_id, task_spec.difficulty, "END")
     return {
         "task_id": task_spec.task_id,
         "difficulty": task_spec.difficulty,
@@ -562,6 +574,8 @@ async def run_single_task(
         "expected_row_count": final_result.observation.expected_row_count,
         "tool_rounds": tool_rounds,
         "assistant_summary": final_text,
+        "steps": runtime_state.steps,
+        "rewards": runtime_state.rewards,
         "reward_breakdown": (
             final_result.observation.reward_breakdown.model_dump()
             if final_result.observation.reward_breakdown
@@ -580,9 +594,16 @@ async def run_single_task_with_retries(
 
     for attempt in range(1, attempts + 1):
         env = None
+        success = False
+        steps = 0
+        rewards: list[float] = []
         try:
             env = await connect_env()
-            return await run_single_task(client, env, task_id)
+            summary = await run_single_task(client, env, task_id)
+            success = bool(summary["success"])
+            steps = int(summary["steps"])
+            rewards = list(summary["rewards"])
+            return summary
         except (ConnectionClosedError, ConnectionError, TimeoutError, OSError) as exc:
             last_error = exc
             print(
@@ -591,6 +612,7 @@ async def run_single_task_with_retries(
                     f"env_connection_error={type(exc).__name__}: {exc}"
                 ),
                 flush=True,
+                file=sys.stderr,
             )
             if attempt >= attempts:
                 raise
@@ -600,6 +622,8 @@ async def run_single_task_with_retries(
                     await env.close()
             except Exception:
                 pass
+            if env is not None:
+                log_end(success=success, steps=steps, rewards=rewards)
 
     assert last_error is not None
     raise last_error
@@ -612,31 +636,8 @@ async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     task_summaries: list[dict[str, Any]] = []
 
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
-
     for task_id in DEFAULT_TASK_ORDER:
         task_summaries.append(await run_single_task_with_retries(client, task_id))
-
-    average_score = (
-        round(sum(item["score"] for item in task_summaries) / len(task_summaries), 6)
-        if task_summaries
-        else 0.0
-    )
-    print(
-        json.dumps(
-            {
-                "benchmark": BENCHMARK,
-                "model": MODEL_NAME,
-                "task_count": len(task_summaries),
-                "task_ids": [item["task_id"] for item in task_summaries],
-                "average_score": average_score,
-                "successful_tasks": sum(1 for item in task_summaries if item["success"]),
-                "tasks": task_summaries,
-            },
-            indent=2,
-        ),
-        flush=True,
-    )
 
 
 if __name__ == "__main__":
